@@ -7,27 +7,24 @@ from typing import Any
 from pathlib import Path
 
 import structlog
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 from sqlalchemy import text as sql_text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
-from app.models.database import async_engine, async_session_factory, get_db, init_db
+from app.models.database import async_engine, async_session_factory, init_db
 from app.models.schemas import (
     QueryRequest,
     QueryResponse,
     DocumentIngest,
     DocumentIngestResponse,
     HealthResponse,
-    SourceDocument,
 )
 from app.services.agent import agent_orchestrator
-from app.services.embeddings import embedding_service
-from app.services.vectordb import vectordb_service
+from app.services.vectordb import health_check as vectordb_health_check
 from app.ingestion.pipeline import ingestion_pipeline
 from app.evaluation.metrics import metrics_collector
 from app.mcp.context import context_manager
@@ -45,7 +42,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    await embedding_service.close()
     await context_manager.close()
     await metrics_collector.close()
     await async_engine.dispose()
@@ -54,8 +50,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Agentic RAG System",
-    description="Agentic AI + RAG system with MCP tool orchestration",
-    version="1.0.0",
+    description="Agentic AI + RAG system with LangChain, LangGraph & FastMCP",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -106,7 +102,7 @@ async def health_check():
             pass
 
     try:
-        pinecone_ok = await vectordb_service.health_check()
+        pinecone_ok = await vectordb_health_check()
     except Exception:
         pass
 
@@ -121,18 +117,11 @@ async def health_check():
 # ── Agent Query ──────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["agent"])
-async def agent_query(
-    request: QueryRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Send a query to the AI agent. The agent uses RAG retrieval and
-    tool calls to produce a grounded answer.
-    """
+async def agent_query(request: QueryRequest):
+    """Send a query to the LangGraph agent (non-streaming)."""
     try:
         result = await agent_orchestrator.run(
             query=request.query,
-            db=db,
             session_id=str(request.session_id) if request.session_id else None,
             tenant_id=str(request.tenant_id) if request.tenant_id else None,
         )
@@ -163,47 +152,42 @@ async def agent_query(
 
 @app.post("/query/stream", tags=["agent"])
 async def agent_query_stream(request: QueryRequest):
-    """
-    Stream the agent response as Server-Sent Events.
-    Events: status, tool_call, tool_result, token, done, error.
-    """
+    """Stream the agent response as Server-Sent Events."""
     import json as _json
 
     async def event_generator():
-        async with async_session_factory() as db:
-            try:
-                async for event in agent_orchestrator.run_stream(
-                    query=request.query,
-                    db=db,
-                    session_id=str(request.session_id) if request.session_id else None,
-                    tenant_id=str(request.tenant_id) if request.tenant_id else None,
-                ):
-                    evt_type = event["event"]
-                    data = event["data"]
-                    if isinstance(data, dict):
-                        payload = _json.dumps(data, default=str)
-                    else:
-                        payload = str(data)
-                    yield f"event: {evt_type}\ndata: {payload}\n\n"
+        try:
+            async for event in agent_orchestrator.run_stream(
+                query=request.query,
+                session_id=str(request.session_id) if request.session_id else None,
+                tenant_id=str(request.tenant_id) if request.tenant_id else None,
+            ):
+                evt_type = event["event"]
+                data = event["data"]
+                if isinstance(data, dict):
+                    payload = _json.dumps(data, default=str)
+                else:
+                    payload = str(data)
+                yield f"event: {evt_type}\ndata: {payload}\n\n"
 
-                    if evt_type == "done" and isinstance(data, dict):
-                        try:
-                            agent_metrics = metrics_collector.evaluate_agent_run(
-                                tool_calls=data.get("tool_calls", []),
-                                iterations=data.get("iterations", 0),
-                                latency_ms=data.get("latency_ms", 0),
-                            )
-                            await metrics_collector.record_query_metrics(
-                                session_id=data.get("session_id", ""),
-                                agent=agent_metrics,
-                            )
-                        except Exception:
-                            pass
+                if evt_type == "done" and isinstance(data, dict):
+                    try:
+                        agent_metrics = metrics_collector.evaluate_agent_run(
+                            tool_calls=data.get("tool_calls", []),
+                            iterations=data.get("iterations", 0),
+                            latency_ms=data.get("latency_ms", 0),
+                        )
+                        await metrics_collector.record_query_metrics(
+                            session_id=data.get("session_id", ""),
+                            agent=agent_metrics,
+                        )
+                    except Exception:
+                        pass
 
-            except Exception as e:
-                err_msg = str(e).encode("ascii", errors="replace").decode("ascii")
-                logger.error("agent_stream_failed", query=request.query[:80], error=err_msg)
-                yield f"event: error\ndata: {err_msg}\n\n"
+        except Exception as e:
+            err_msg = str(e).encode("ascii", errors="replace").decode("ascii")
+            logger.error("agent_stream_failed", query=request.query[:80], error=err_msg)
+            yield f"event: error\ndata: {err_msg}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -220,10 +204,7 @@ async def agent_query_stream(request: QueryRequest):
 
 @app.post("/ingest", response_model=DocumentIngestResponse, tags=["ingestion"])
 async def ingest_document(request: DocumentIngest):
-    """
-    Ingest a document into the knowledge base.
-    In dev mode, runs synchronously. In production, uses Celery queue.
-    """
+    """Ingest a document. Dev mode = sync, production = Celery queue."""
     if settings.dev_mode:
         result = await ingestion_pipeline.ingest(
             title=request.title,
@@ -297,14 +278,12 @@ async def search_documents(
     top_k: int = 5,
     doc_type: str | None = None,
     tenant_id: str | None = None,
-    db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Direct RAG retrieval without the agent loop."""
     from app.services.rag_pipeline import rag_pipeline
 
     results = await rag_pipeline.retrieve(
         query=query,
-        db=db,
         top_k=top_k,
         doc_type=doc_type,
         tenant_id=tenant_id,
@@ -328,7 +307,6 @@ async def mcp_dispatch_tool(
     arguments: dict[str, Any],
     session_id: str | None = None,
     role: str = "analyst",
-    db: AsyncSession = Depends(get_db),
 ) -> Any:
     """Dispatch an MCP tool call with permission checks."""
     from app.mcp.tools import dispatch_tool
@@ -339,7 +317,6 @@ async def mcp_dispatch_tool(
             arguments=arguments,
             session_id=session_id,
             role=role,
-            db_session=db,
         )
         return {"result": result}
     except PermissionError as e:

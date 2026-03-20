@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 *.so
 .env
+.env.local
 .venv/
 venv/
 env/
@@ -20,3 +21,15 @@ Thumbs.db
 *.sqlite3
 *.db
 rag.jpg
+aiosqlite/
+
+# Terraform
+infrastructure/.terraform/
+infrastructure/*.tfstate
+infrastructure/*.tfstate.backup
+infrastructure/tfplan
+infrastructure/.terraform.lock.hcl
+infrastructure/terraform.tfvars
+
+# Docker
+*.tar

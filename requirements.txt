@@ -5,11 +5,16 @@ pydantic>=2.10.0
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.1
 
+# LangChain ecosystem
+langchain>=0.3.10
+langchain-core>=0.3.25
+langchain-openai>=0.2.12
+langchain-pinecone>=0.2.0
+langchain-community>=0.3.10
+langgraph>=0.2.60
+
 # LLM & Embeddings
 openai>=1.57.0
-langchain>=0.3.10
-langchain-openai>=0.2.12
-langgraph>=0.2.60
 
 # Vector Database
 pinecone>=6.0.0
@@ -17,6 +22,7 @@ pinecone>=6.0.0
 # SQL Database
 sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
+aiosqlite>=0.20.0
 psycopg2-binary>=2.9.10
 pgvector>=0.3.6
 alembic>=1.14.0

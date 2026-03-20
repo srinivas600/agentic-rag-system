@@ -1,24 +1,25 @@
+"""Async document ingestion pipeline.
+
+Flow: receive document → hierarchical chunk → embed via LangChain →
+      upsert to PineconeVectorStore → insert metadata to SQL.
+"""
 from __future__ import annotations
 
 import uuid
 from typing import Any
 
 import structlog
+from langchain_core.documents import Document as LCDocument
 from sqlalchemy import text as sql_text
 
-from app.ingestion.chunking import chunker, Chunk
+from app.ingestion.chunking import chunker
 from app.models.database import async_session_factory
-from app.services.embeddings import embedding_service
-from app.services.vectordb import vectordb_service
 
 logger = structlog.get_logger(__name__)
 
 
 class IngestionPipeline:
-    """
-    Async document ingestion pipeline.
-    Flow: receive document -> chunk -> embed -> upsert to VectorDB -> insert metadata to SQL.
-    """
+    """Ingest documents through chunking → embedding → vector + SQL storage."""
 
     async def ingest(
         self,
@@ -28,11 +29,6 @@ class IngestionPipeline:
         doc_type: str | None = None,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Ingest a single document through the full pipeline.
-
-        Returns dict with document_id and chunk_count.
-        """
         doc_id = str(uuid.uuid4())
         namespace = tenant_id or ""
 
@@ -40,44 +36,45 @@ class IngestionPipeline:
 
         # 1. Hierarchical chunking
         chunks = chunker.chunk(content, doc_id=doc_id)
-
-        # Separate parent and child chunks
         parent_chunks = [c for c in chunks if c.is_parent]
         child_chunks = [c for c in chunks if not c.is_parent]
 
-        # 2. Embed child chunks (used for retrieval)
-        child_texts = [c.text for c in child_chunks]
-        embeddings = await embedding_service.embed_batch(child_texts) if child_texts else []
+        # 2+3. Build LangChain Documents and add to PineconeVectorStore
+        #       (handles embedding + upsert in one call)
+        if child_chunks:
+            from app.services.vectordb import get_vectorstore
 
-        # 3. Upsert child chunk embeddings to VectorDB
-        vectors = []
-        for chunk, embedding in zip(child_chunks, embeddings):
-            vectors.append({
-                "id": chunk.id,
-                "values": embedding,
-                "metadata": {
-                    "doc_id": doc_id,
-                    "parent_id": chunk.parent_id,
-                    "text_chunk": chunk.text,
-                    "doc_type": doc_type or "",
-                    "source_url": source_url or "",
-                    "title": title,
-                    "chunk_index": chunk.chunk_index,
-                    "is_child": True,
-                },
-            })
+            vectorstore = get_vectorstore()
 
-        if vectors:
-            await vectordb_service.upsert(vectors, namespace=namespace)
+            lc_docs = [
+                LCDocument(
+                    page_content=chunk.text,
+                    metadata={
+                        "doc_id": doc_id,
+                        "parent_id": chunk.parent_id or "",
+                        "doc_type": doc_type or "",
+                        "source_url": source_url or "",
+                        "title": title,
+                        "chunk_index": chunk.chunk_index,
+                        "is_child": True,
+                    },
+                )
+                for chunk in child_chunks
+            ]
+            ids = [chunk.id for chunk in child_chunks]
+
+            await vectorstore.aadd_documents(
+                lc_docs, ids=ids, namespace=namespace
+            )
 
         # 4. Insert metadata into SQL
         async with async_session_factory() as session:
-            # Insert parent chunks
             for pc in parent_chunks:
                 await session.execute(
                     sql_text("""
-                        INSERT INTO documents (id, title, source_url, doc_type, tenant_id,
-                                               content, chunk_index, token_count, embedding_id)
+                        INSERT INTO documents (id, title, source_url, doc_type,
+                                               tenant_id, content, chunk_index,
+                                               token_count, embedding_id)
                         VALUES (:id, :title, :source_url, :doc_type, :tenant_id,
                                 :content, :chunk_index, :token_count, :embedding_id)
                     """),
@@ -94,13 +91,13 @@ class IngestionPipeline:
                     },
                 )
 
-            # Insert child chunks with reference to parent
             for cc in child_chunks:
                 await session.execute(
                     sql_text("""
-                        INSERT INTO documents (id, title, source_url, doc_type, tenant_id,
-                                               content, parent_chunk_id, chunk_index,
-                                               token_count, embedding_id)
+                        INSERT INTO documents (id, title, source_url, doc_type,
+                                               tenant_id, content, parent_chunk_id,
+                                               chunk_index, token_count,
+                                               embedding_id)
                         VALUES (:id, :title, :source_url, :doc_type, :tenant_id,
                                 :content, :parent_chunk_id, :chunk_index,
                                 :token_count, :embedding_id)
@@ -126,7 +123,6 @@ class IngestionPipeline:
             doc_id=doc_id,
             parent_chunks=len(parent_chunks),
             child_chunks=len(child_chunks),
-            vectors_upserted=len(vectors),
         )
 
         return {
@@ -137,10 +133,8 @@ class IngestionPipeline:
         }
 
     async def ingest_batch(
-        self,
-        documents: list[dict[str, Any]],
+        self, documents: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Ingest multiple documents sequentially."""
         results = []
         for doc in documents:
             result = await self.ingest(**doc)

@@ -1,0 +1,22 @@
+aws_region          = "us-east-1"
+project_name        = "rag-agent"
+environment         = "production"
+
+# Database
+db_instance_class   = "db.t3.micro"
+db_name             = "ragagent"
+db_username         = "ragadmin"
+db_password         = "CHANGE_ME_strong_password_123!"
+
+# Redis
+redis_node_type     = "cache.t3.micro"
+
+# ECS
+api_cpu             = 512
+api_memory          = 1024
+api_desired_count   = 2
+
+# Secrets (get from your accounts)
+openai_api_key      = "sk-..."
+pinecone_api_key    = "pcsk_..."
+pinecone_index_name = "rag-documents"

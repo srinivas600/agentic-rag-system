@@ -207,22 +207,136 @@ curl -X POST "http://localhost:8000/mcp/dispatch?tool_name=sql_lookup&role=analy
 │       └── metrics.py          # RAG & agent evaluation metrics
 ├── config/
 │   └── settings.py             # Pydantic settings (env-driven)
+├── frontend/
+│   ├── index.html              # SPA with streaming chat UI
+│   ├── styles.css              # Tailwind-based styles
+│   └── app.js                  # Frontend JS (SSE streaming)
+├── infrastructure/
+│   ├── main.tf                 # AWS VPC, ECS, RDS, Redis, ALB
+│   ├── variables.tf            # Terraform variables
+│   ├── outputs.tf              # Terraform outputs
+│   └── terraform.tfvars.example
+├── .github/workflows/
+│   └── deploy.yml              # CI/CD: build → ECR → ECS
 ├── scripts/
-│   └── init_db.sql             # PostgreSQL schema initialization
-├── docker-compose.yml
-├── Dockerfile
+│   ├── init_db.sql             # PostgreSQL schema initialization
+│   ├── seed_data.py            # Populate DBs with realistic data
+│   └── deploy.sh               # One-command AWS deployment
+├── docker-compose.yml          # Full local stack
+├── Dockerfile                  # Multi-stage production build
+├── .dockerignore
 ├── requirements.txt
 └── .env.example
 ```
 
-## Build Order (Incremental)
+## Docker (Local)
 
-Following the plan's recommendation to start small:
+Run the full stack locally with Docker Compose:
 
-1. **Single-tool RAG agent** — `vector_search` only
-2. **Add SQL lookup** — structured data queries via named registry
-3. **MCP server extraction** — standalone tool server
-4. **Multi-agent patterns** — extend with sub-agents as needed
+```bash
+# Copy and fill in your secrets
+cp .env.example .env
+
+# Start everything (Postgres + Redis + API + Celery worker)
+docker compose up --build -d
+
+# Verify
+curl http://localhost:8000/health
+```
+
+The API is at `http://localhost:8000` and serves the frontend at `/`.
+
+## AWS Deployment
+
+The project ships with production-ready Terraform infrastructure targeting **AWS ECS Fargate**.
+
+### AWS Architecture
+
+| Component | AWS Service | Purpose |
+|-----------|-------------|---------|
+| Compute | ECS Fargate | Serverless containers for API & Celery |
+| Database | RDS PostgreSQL 16 | Relational data + pgvector |
+| Cache | ElastiCache Redis 7 | Session cache & Celery broker |
+| Registry | ECR | Private Docker image registry |
+| Load Balancer | ALB | HTTPS termination, health checks |
+| Secrets | Secrets Manager | API keys & DB credentials |
+| Networking | VPC + NAT | Private subnets for data tier |
+| Scaling | App Auto Scaling | CPU-based 2-6 instance scaling |
+| Logs | CloudWatch Logs | Centralized log aggregation |
+
+### Prerequisites
+
+- **AWS CLI** configured with credentials (`aws configure`)
+- **Terraform** >= 1.5
+- **Docker** installed locally
+
+### Step-by-Step Deployment
+
+```bash
+# 1. Configure Terraform variables
+cd infrastructure
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your secrets (API keys, DB password, etc.)
+
+# 2. Deploy infrastructure
+terraform init
+terraform plan
+terraform apply
+
+# 3. Build & push Docker image to ECR
+# (Get ECR URL from terraform output)
+ECR_URL=$(terraform output -raw ecr_repository_url)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_URL
+
+cd ..
+docker build -t $ECR_URL:latest --target production .
+docker push $ECR_URL:latest
+
+# 4. Force ECS to pick up the new image
+aws ecs update-service \
+  --cluster rag-agent-production-cluster \
+  --service rag-agent-production-api \
+  --force-new-deployment
+
+# 5. Get the app URL
+cd infrastructure
+echo "App URL: http://$(terraform output -raw alb_dns_name)"
+```
+
+### One-Command Deploy
+
+Alternatively, use the deploy script:
+
+```bash
+chmod +x scripts/deploy.sh
+
+./scripts/deploy.sh              # Full: infra + build + push + deploy
+./scripts/deploy.sh infra        # Terraform only
+./scripts/deploy.sh build        # Docker build & push only
+./scripts/deploy.sh ecs-update   # Force new ECS deployment
+```
+
+### CI/CD (GitHub Actions)
+
+Push-to-deploy is configured in `.github/workflows/deploy.yml`. Set these GitHub secrets:
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ROLE_ARN` | IAM role ARN for OIDC auth |
+
+The workflow triggers on push to `main`: builds the image, pushes to ECR, and updates ECS.
+
+### Cost Estimate (Minimal Setup)
+
+| Service | Config | ~Monthly Cost |
+|---------|--------|---------------|
+| ECS Fargate | 2 tasks × 0.5 vCPU / 1 GB | ~$30 |
+| RDS | db.t3.micro, 20GB | ~$15 |
+| ElastiCache | cache.t3.micro | ~$12 |
+| ALB | 1 LB | ~$18 |
+| NAT Gateway | 1 AZ | ~$33 |
+| ECR / Logs | Minimal storage | ~$2 |
+| **Total** | | **~$110/mo** |
 
 ## Evaluation
 
