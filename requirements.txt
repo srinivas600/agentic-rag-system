@@ -1,0 +1,51 @@
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+
+# LLM & Embeddings
+openai>=1.57.0
+langchain>=0.3.10
+langchain-openai>=0.2.12
+langgraph>=0.2.60
+
+# Vector Database
+pinecone>=6.0.0
+
+# SQL Database
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.10
+pgvector>=0.3.6
+alembic>=1.14.0
+
+# Redis
+redis>=5.2.0
+
+# Re-ranking
+sentence-transformers>=3.3.0
+
+# MCP
+fastmcp>=0.4.0
+
+# Ingestion & Processing
+tiktoken>=0.8.0
+unstructured>=0.16.0
+python-multipart>=0.0.19
+
+# Evaluation
+ragas>=0.2.8
+
+# Observability
+langsmith>=0.2.0
+
+# Task Queue
+celery[redis]>=5.4.0
+
+# Utilities
+httpx>=0.28.0
+tenacity>=9.0.0
+structlog>=24.4.0
+uuid6>=2024.7.10

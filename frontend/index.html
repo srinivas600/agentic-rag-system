@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Agent</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        surface: { 50: '#f8fafc', 100: '#f1f5f9', 200: '#e2e8f0', 700: '#1e293b', 800: '#0f172a', 900: '#020617' },
+                        accent: { 400: '#818cf8', 500: '#6366f1', 600: '#4f46e5' },
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="h-full bg-surface-900 text-slate-200 font-sans antialiased">
+    <div id="app" class="flex h-full">
+
+        <!-- Sidebar -->
+        <aside class="w-64 bg-surface-800 border-r border-slate-700/50 flex flex-col shrink-0">
+            <div class="p-5 border-b border-slate-700/50">
+                <div class="flex items-center gap-3">
+                    <div class="w-9 h-9 rounded-lg bg-accent-500/20 flex items-center justify-center">
+                        <svg class="w-5 h-5 text-accent-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                    </div>
+                    <div>
+                        <h1 class="text-base font-semibold text-white">RAG Agent</h1>
+                        <p class="text-xs text-slate-400">Agentic AI + MCP</p>
+                    </div>
+                </div>
+            </div>
+
+            <nav class="flex-1 p-3 space-y-1">
+                <button onclick="switchTab('chat')" id="nav-chat" class="nav-btn active w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+                    Chat
+                </button>
+                <button onclick="switchTab('ingest')" id="nav-ingest" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+                    Ingest Documents
+                </button>
+                <button onclick="switchTab('dashboard')" id="nav-dashboard" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                    Dashboard
+                </button>
+            </nav>
+
+            <!-- Health Status -->
+            <div class="p-4 border-t border-slate-700/50">
+                <div class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">System Health</div>
+                <div id="health-indicators" class="space-y-2">
+                    <div class="flex items-center justify-between text-xs">
+                        <span class="text-slate-400">PostgreSQL</span>
+                        <span id="health-pg" class="status-dot"></span>
+                    </div>
+                    <div class="flex items-center justify-between text-xs">
+                        <span class="text-slate-400">Redis</span>
+                        <span id="health-redis" class="status-dot"></span>
+                    </div>
+                    <div class="flex items-center justify-between text-xs">
+                        <span class="text-slate-400">Pinecone</span>
+                        <span id="health-pinecone" class="status-dot"></span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="flex-1 flex flex-col min-w-0">
+
+            <!-- Chat Tab -->
+            <div id="tab-chat" class="tab-content active flex-1 flex flex-col">
+                <div class="border-b border-slate-700/50 px-6 py-4 flex items-center justify-between bg-surface-800/50">
+                    <div>
+                        <h2 class="text-lg font-semibold text-white">Chat</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">Ask questions grounded in your knowledge base</p>
+                    </div>
+                    <button onclick="clearChat()" class="text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-md hover:bg-slate-700/50 transition-colors">Clear chat</button>
+                </div>
+
+                <div id="chat-messages" class="flex-1 overflow-y-auto p-6 space-y-6">
+                    <div class="flex justify-center py-16">
+                        <div class="text-center max-w-md">
+                            <div class="w-16 h-16 rounded-2xl bg-accent-500/10 flex items-center justify-center mx-auto mb-5">
+                                <svg class="w-8 h-8 text-accent-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-white mb-2">How can I help you?</h3>
+                            <p class="text-sm text-slate-400">Ask anything about your ingested documents. I'll use semantic search and structured queries to find the best answer.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="border-t border-slate-700/50 p-4 bg-surface-800/30">
+                    <form onsubmit="sendMessage(event)" class="flex gap-3 max-w-4xl mx-auto">
+                        <input id="chat-input" type="text" placeholder="Ask a question..." 
+                            class="flex-1 bg-surface-700 border border-slate-600/50 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-accent-500/50 focus:border-accent-500/50 transition-all"
+                            autocomplete="off">
+                        <button type="submit" id="send-btn" class="bg-accent-500 hover:bg-accent-600 text-white px-5 py-3 rounded-xl text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+                            Send
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Ingest Tab -->
+            <div id="tab-ingest" class="tab-content flex-1 flex flex-col hidden">
+                <div class="border-b border-slate-700/50 px-6 py-4 bg-surface-800/50">
+                    <h2 class="text-lg font-semibold text-white">Ingest Documents</h2>
+                    <p class="text-xs text-slate-400 mt-0.5">Add documents to the knowledge base for RAG retrieval</p>
+                </div>
+
+                <div class="flex-1 overflow-y-auto p-6">
+                    <div class="max-w-2xl mx-auto">
+                        <form onsubmit="ingestDocument(event)" class="space-y-5">
+                            <div>
+                                <label class="block text-sm font-medium text-slate-300 mb-1.5">Title</label>
+                                <input id="ingest-title" type="text" required placeholder="e.g. Product Documentation"
+                                    class="w-full bg-surface-700 border border-slate-600/50 rounded-lg px-4 py-2.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-accent-500/50">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-slate-300 mb-1.5">Content</label>
+                                <textarea id="ingest-content" required rows="10" placeholder="Paste your document content here..."
+                                    class="w-full bg-surface-700 border border-slate-600/50 rounded-lg px-4 py-2.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-accent-500/50 resize-y font-mono"></textarea>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-slate-300 mb-1.5">Document Type</label>
+                                    <select id="ingest-doc-type" class="w-full bg-surface-700 border border-slate-600/50 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-accent-500/50">
+                                        <option value="">Select type...</option>
+                                        <option value="support">Support Article</option>
+                                        <option value="research">Research Paper</option>
+                                        <option value="product">Product Description</option>
+                                        <option value="documentation">Documentation</option>
+                                        <option value="other">Other</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-slate-300 mb-1.5">Source URL</label>
+                                    <input id="ingest-source-url" type="url" placeholder="https://..."
+                                        class="w-full bg-surface-700 border border-slate-600/50 rounded-lg px-4 py-2.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-accent-500/50">
+                                </div>
+                            </div>
+                            <button type="submit" id="ingest-btn" class="w-full bg-accent-500 hover:bg-accent-600 text-white py-3 rounded-xl text-sm font-medium transition-colors flex items-center justify-center gap-2 disabled:opacity-50">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+                                Ingest Document
+                            </button>
+                        </form>
+
+                        <div id="ingest-results" class="mt-6 space-y-3"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dashboard Tab -->
+            <div id="tab-dashboard" class="tab-content flex-1 flex flex-col hidden">
+                <div class="border-b border-slate-700/50 px-6 py-4 bg-surface-800/50 flex items-center justify-between">
+                    <div>
+                        <h2 class="text-lg font-semibold text-white">Dashboard</h2>
+                        <p class="text-xs text-slate-400 mt-0.5">System metrics and agent performance</p>
+                    </div>
+                    <button onclick="refreshMetrics()" class="text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-md hover:bg-slate-700/50 transition-colors flex items-center gap-1.5">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        Refresh
+                    </button>
+                </div>
+
+                <div class="flex-1 overflow-y-auto p-6">
+                    <div class="max-w-5xl mx-auto space-y-6">
+                        <!-- Agent Metrics -->
+                        <div>
+                            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Agent Performance</h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-1">Avg Latency</div>
+                                    <div id="metric-latency" class="text-2xl font-bold text-white">--</div>
+                                    <div class="text-xs text-slate-500 mt-1">milliseconds</div>
+                                </div>
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-1">Avg Tool Calls</div>
+                                    <div id="metric-tool-calls" class="text-2xl font-bold text-white">--</div>
+                                    <div class="text-xs text-slate-500 mt-1">per query</div>
+                                </div>
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-1">Avg Iterations</div>
+                                    <div id="metric-iterations" class="text-2xl font-bold text-white">--</div>
+                                    <div class="text-xs text-slate-500 mt-1">per query</div>
+                                </div>
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-1">High Iteration Sessions</div>
+                                    <div id="metric-high-iter" class="text-2xl font-bold text-white">--</div>
+                                    <div class="text-xs text-slate-500 mt-1">&gt;4 iterations</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Retrieval Metrics -->
+                        <div>
+                            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Retrieval Quality</h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-2">Context Recall</div>
+                                    <div class="flex items-end gap-2">
+                                        <span id="metric-recall" class="text-2xl font-bold text-white">--</span>
+                                    </div>
+                                    <div class="mt-3 h-2 bg-surface-700 rounded-full overflow-hidden">
+                                        <div id="bar-recall" class="h-full bg-emerald-500 rounded-full transition-all duration-500" style="width:0%"></div>
+                                    </div>
+                                </div>
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-2">Context Precision</div>
+                                    <div class="flex items-end gap-2">
+                                        <span id="metric-precision" class="text-2xl font-bold text-white">--</span>
+                                    </div>
+                                    <div class="mt-3 h-2 bg-surface-700 rounded-full overflow-hidden">
+                                        <div id="bar-precision" class="h-full bg-blue-500 rounded-full transition-all duration-500" style="width:0%"></div>
+                                    </div>
+                                </div>
+                                <div class="metric-card bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-2">MRR</div>
+                                    <div class="flex items-end gap-2">
+                                        <span id="metric-mrr" class="text-2xl font-bold text-white">--</span>
+                                    </div>
+                                    <div class="mt-3 h-2 bg-surface-700 rounded-full overflow-hidden">
+                                        <div id="bar-mrr" class="h-full bg-violet-500 rounded-full transition-all duration-500" style="width:0%"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tool Frequency -->
+                        <div>
+                            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Tool Usage</h3>
+                            <div id="tool-frequency" class="bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                <div class="text-sm text-slate-400">No tool usage data yet</div>
+                            </div>
+                        </div>
+
+                        <!-- MCP Tools -->
+                        <div>
+                            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Available MCP Tools</h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div class="bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-3 font-medium uppercase tracking-wider">Analyst</div>
+                                    <div id="tools-analyst" class="space-y-1.5"></div>
+                                </div>
+                                <div class="bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-3 font-medium uppercase tracking-wider">Admin</div>
+                                    <div id="tools-admin" class="space-y-1.5"></div>
+                                </div>
+                                <div class="bg-surface-800 border border-slate-700/50 rounded-xl p-5">
+                                    <div class="text-xs text-slate-400 mb-3 font-medium uppercase tracking-wider">Viewer</div>
+                                    <div id="tools-viewer" class="space-y-1.5"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
