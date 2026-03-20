@@ -27,16 +27,31 @@ from app.services.rag_pipeline import rag_pipeline
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are an intelligent AI assistant with access to a knowledge base and structured data.
+SYSTEM_PROMPT = """You are an intelligent AI assistant with access to a knowledge base and a product catalog.
 
-When answering questions:
-1. Use the vector_search tool to find relevant documents from the knowledge base.
-2. Use the sql_lookup tool to query structured business data (products, sessions, etc.).
-3. Always ground your answers in the retrieved context — never fabricate information.
-4. If the retrieved context doesn't contain the answer, say so honestly.
-5. Cite sources when possible.
+You have two tools:
 
-Be concise, accurate, and helpful."""
+1. **vector_search** — semantic search over a knowledge base of documents covering topics like:
+   AI/ML, RAG, Transformers, fine-tuning, vector databases, Kubernetes, PostgreSQL,
+   microservices, CI/CD, API security, Kafka, SaaS pricing, quantum computing,
+   remote work policies, and engineering onboarding.
+
+2. **sql_lookup** — query the product catalog and session data. Available queries:
+   - "products_by_category": params {"category": "<name>"} — categories are EXACTLY:
+     "Electronics", "Software", "Books", "Cloud", "Office"
+   - "product_search": params {"pattern": "%keyword%"} — search products by name (use % wildcards)
+   - "all_products": no params needed — returns all products
+   - "products_by_price": params {"max_price": <number>} — products under a price
+   - "products_by_price_category": params {"category": "<name>", "max_price": <number>}
+   - "product_by_id": params {"id": "<uuid>"}
+   - "recent_sessions": no required params
+
+Rules:
+- ALWAYS call a tool before answering. Never guess or refuse without trying.
+- For product questions, use sql_lookup. For knowledge questions, use vector_search.
+- If a product query returns no results, try "product_search" with a broader pattern or "all_products".
+- Ground answers in retrieved data. If nothing is found, say so honestly.
+- Be concise, accurate, and helpful. Cite sources when possible."""
 
 
 class AgentState(TypedDict):
@@ -78,17 +93,37 @@ def _build_tools(db_session: AsyncSession):
 
     @tool
     async def sql_lookup(query_name: str, params: dict | None = None) -> str:
-        """Run a pre-registered named SQL query against the business database.
-        Available queries: 'product_by_id', 'products_by_category',
-        'product_search', 'session_by_id', 'recent_sessions'.
+        """Query the product catalog or session data using a named query.
+
+        Available query_name values and their params:
+        - "all_products": no params — returns all products
+        - "products_by_category": {"category": "Electronics"} — exact category: Electronics, Software, Books, Cloud, Office
+        - "products_by_price": {"max_price": 500} — all products under a price
+        - "products_by_price_category": {"category": "Electronics", "max_price": 500} — filter by both
+        - "product_search": {"pattern": "%keyboard%"} — search by name with SQL wildcards
+        - "product_by_id": {"id": "<uuid>"}
+        - "recent_sessions": no required params
         """
         from sqlalchemy import text as sql_text
 
         query_registry = {
             "product_by_id": "SELECT * FROM products WHERE id = :id",
+            "all_products": (
+                "SELECT id, name, category, price, inventory FROM products "
+                "ORDER BY category, name LIMIT :limit"
+            ),
             "products_by_category": (
                 "SELECT id, name, category, price, inventory FROM products "
                 "WHERE LOWER(category) = LOWER(:category) ORDER BY name LIMIT :limit"
+            ),
+            "products_by_price": (
+                "SELECT id, name, category, price, inventory FROM products "
+                "WHERE price <= :max_price ORDER BY price ASC LIMIT :limit"
+            ),
+            "products_by_price_category": (
+                "SELECT id, name, category, price, inventory FROM products "
+                "WHERE LOWER(category) = LOWER(:category) AND price <= :max_price "
+                "ORDER BY price ASC LIMIT :limit"
             ),
             "product_search": (
                 "SELECT id, name, category, price, inventory FROM products "

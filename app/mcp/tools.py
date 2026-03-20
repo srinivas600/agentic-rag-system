@@ -13,9 +13,22 @@ logger = structlog.get_logger(__name__)
 
 QUERY_REGISTRY: dict[str, str] = {
     "product_by_id": "SELECT * FROM products WHERE id = :id",
+    "all_products": (
+        "SELECT id, name, category, price, inventory FROM products "
+        "ORDER BY category, name LIMIT :limit"
+    ),
     "products_by_category": (
         "SELECT id, name, category, price, inventory FROM products "
         "WHERE LOWER(category) = LOWER(:category) ORDER BY name LIMIT :limit"
+    ),
+    "products_by_price": (
+        "SELECT id, name, category, price, inventory FROM products "
+        "WHERE price <= :max_price ORDER BY price ASC LIMIT :limit"
+    ),
+    "products_by_price_category": (
+        "SELECT id, name, category, price, inventory FROM products "
+        "WHERE LOWER(category) = LOWER(:category) AND price <= :max_price "
+        "ORDER BY price ASC LIMIT :limit"
     ),
     "product_search": (
         "SELECT id, name, category, price, inventory FROM products "
