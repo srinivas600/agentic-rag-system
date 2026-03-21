@@ -1,7 +1,7 @@
 """Hybrid retriever: dense (Pinecone) + sparse (SQL) + RRF + cross-encoder reranking.
 
-Uses LangChain's ``EnsembleRetriever`` for Reciprocal Rank Fusion and
-``ContextualCompressionRetriever`` to plug in the cross-encoder compressor.
+Implements Reciprocal Rank Fusion and cross-encoder reranking inside a
+single ``BaseRetriever`` subclass, compatible with any LangChain chain.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import structlog
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from pydantic import Field
 from sqlalchemy import text
 
@@ -28,6 +27,14 @@ class SQLSparseRetriever(BaseRetriever):
 
     k: int = Field(default=20, description="Number of results to return")
     doc_type: str | None = Field(default=None, description="Filter by document type")
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun | None = None,
+    ) -> list[Document]:
+        raise NotImplementedError("Use ainvoke() — this retriever is async-only")
 
     async def _aget_relevant_documents(
         self,
@@ -94,38 +101,108 @@ class SQLSparseRetriever(BaseRetriever):
         return docs
 
 
-# ── Retriever chain factory ──────────────────────────────────────────
+# ── Hybrid retriever (dense + sparse + RRF + reranking) ─────────────
 
-_retriever_chain: ContextualCompressionRetriever | None = None
+class HybridRetriever(BaseRetriever):
+    """Combines PineconeVectorStore (dense) + SQL (sparse) with RRF and reranking.
 
-
-def get_retriever_chain() -> ContextualCompressionRetriever:
-    """Build the full hybrid retriever (cached singleton).
-
-    Pipeline: PineconeVectorStore (dense, k=20)
-            + SQLSparseRetriever  (sparse, k=20)
-            → EnsembleRetriever   (RRF fusion)
-            → CrossEncoderCompressor (reranking)
+    Pipeline:
+      1. Dense search via PineconeVectorStore  (k=20)
+      2. Sparse search via SQLSparseRetriever  (k=20)
+      3. Reciprocal Rank Fusion to merge results
+      4. Cross-encoder reranking for final selection
     """
-    global _retriever_chain
-    if _retriever_chain is not None:
-        return _retriever_chain
 
-    from app.services.vectordb import get_vectorstore
-    from app.services.reranker import get_compressor
+    dense_k: int = Field(default=20)
+    sparse_k: int = Field(default=20)
+    rerank_top_n: int = Field(default=5)
+    rrf_k: int = Field(default=60, description="RRF constant")
 
-    vectorstore = get_vectorstore()
-    dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
-    sparse_retriever = SQLSparseRetriever(k=20)
+    model_config = {"arbitrary_types_allowed": True}
 
-    ensemble = EnsembleRetriever(
-        retrievers=[dense_retriever, sparse_retriever],
-        weights=[0.5, 0.5],
-    )
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun | None = None,
+    ) -> list[Document]:
+        raise NotImplementedError("Use ainvoke() — this retriever is async-only")
 
-    _retriever_chain = ContextualCompressionRetriever(
-        base_compressor=get_compressor(),
-        base_retriever=ensemble,
-    )
-    logger.info("hybrid_retriever_chain_initialized")
-    return _retriever_chain
+    @staticmethod
+    def _rrf_merge(
+        *result_lists: list[Document],
+        k: int = 60,
+    ) -> list[Document]:
+        """Reciprocal Rank Fusion: RRF_score(d) = Σ 1/(k + rank_i(d))."""
+        scores: dict[str, float] = {}
+        doc_map: dict[str, Document] = {}
+
+        for results in result_lists:
+            for rank, doc in enumerate(results):
+                doc_id = doc.metadata.get("id", id(doc))
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+                if doc_id not in doc_map:
+                    doc_map[doc_id] = doc
+
+        for doc_id, doc in doc_map.items():
+            doc.metadata["rrf_score"] = scores[doc_id]
+
+        merged = sorted(
+            doc_map.values(),
+            key=lambda d: d.metadata.get("rrf_score", 0),
+            reverse=True,
+        )
+        return merged
+
+    async def _aget_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun | None = None,
+    ) -> list[Document]:
+        from app.services.vectordb import get_vectorstore
+        from app.services.reranker import get_compressor
+
+        vectorstore = get_vectorstore()
+
+        # 1. Dense (Pinecone) — async via VectorStore
+        dense_docs = await vectorstore.asimilarity_search(query, k=self.dense_k)
+        for doc in dense_docs:
+            doc.metadata.setdefault("source", "dense")
+            doc.metadata.setdefault("id", str(id(doc)))
+
+        # 2. Sparse (SQL)
+        sparse = SQLSparseRetriever(k=self.sparse_k)
+        sparse_docs = await sparse.ainvoke(query)
+
+        # 3. RRF merge
+        merged = self._rrf_merge(dense_docs, sparse_docs, k=self.rrf_k)
+
+        # 4. Cross-encoder reranking
+        compressor = get_compressor()
+        if merged:
+            reranked = compressor.compress_documents(merged, query)
+        else:
+            reranked = []
+
+        logger.info(
+            "hybrid_retrieval",
+            query=query[:80],
+            dense=len(dense_docs),
+            sparse=len(sparse_docs),
+            merged=len(merged),
+            final=len(reranked),
+        )
+        return list(reranked)
+
+
+_retriever: HybridRetriever | None = None
+
+
+def get_retriever_chain() -> HybridRetriever:
+    """Lazy singleton for the full hybrid retriever."""
+    global _retriever
+    if _retriever is None:
+        _retriever = HybridRetriever()
+        logger.info("hybrid_retriever_initialized")
+    return _retriever

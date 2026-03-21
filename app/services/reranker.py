@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 import structlog
 from langchain_core.callbacks import Callbacks
 from langchain_core.documents import Document
-from langchain.retrievers.document_compressors.base import BaseDocumentCompressor
+from langchain_core.documents.compressor import BaseDocumentCompressor
 from pydantic import PrivateAttr
 from sentence_transformers import CrossEncoder
 
