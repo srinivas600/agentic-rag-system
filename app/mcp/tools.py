@@ -1,18 +1,17 @@
-"""Core MCP tool implementations.
-
-This module is the single source of truth for tool logic.  Both the
-LangGraph agent (``app.services.agent``) and the FastMCP server
-(``app.mcp.server``) delegate here — keeping behaviour consistent and DRY.
-"""
 from __future__ import annotations
 
+import io
+import contextlib
+import time
 from typing import Any
 
 import structlog
+from sqlalchemy import text as sql_text
+
+from app.models.database import async_session_factory
+from app.utils.log_utils import log
 
 logger = structlog.get_logger(__name__)
-
-# ── Named SQL Query Registry (no raw SQL injection) ─────────────────
 
 QUERY_REGISTRY: dict[str, str] = {
     "product_by_id": "SELECT * FROM products WHERE id = :id",
@@ -49,8 +48,6 @@ QUERY_REGISTRY: dict[str, str] = {
     ),
 }
 
-# ── Role-based access control ────────────────────────────────────────
-
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "analyst": {"vector_search", "sql_lookup"},
     "admin": {"vector_search", "sql_lookup", "code_interpreter"},
@@ -62,15 +59,19 @@ def check_permission(role: str, tool_name: str) -> bool:
     return tool_name in ROLE_PERMISSIONS.get(role, set())
 
 
-# ── Core Implementations ─────────────────────────────────────────────
-
 async def vector_search_impl(
     query: str,
     top_k: int = 5,
     doc_type: str | None = None,
 ) -> str:
-    """Run the full RAG pipeline and return formatted results."""
     from app.services.rag_pipeline import rag_pipeline
+
+    t0 = time.perf_counter()
+    log(f"\n{'~'*70}")
+    log(f"  TOOL: vector_search")
+    log(f"  Query: {query}")
+    log(f"  Params: top_k={top_k}, doc_type={doc_type}")
+    log(f"{'~'*70}")
 
     results = await rag_pipeline.retrieve(
         query=query,
@@ -80,6 +81,7 @@ async def vector_search_impl(
         use_reranker=True,
     )
     if not results:
+        log(f"  TOOL RESULT: No relevant documents found.")
         return "No relevant documents found."
 
     parts: list[str] = []
@@ -88,18 +90,30 @@ async def vector_search_impl(
         source = r.get("source_url", "unknown")
         text = r.get("text", "")[:500]
         parts.append(f"[{i}] (score={score:.3f}, source={source})\n{text}")
-    return "\n\n".join(parts)
+
+    output = "\n\n".join(parts)
+    elapsed = round((time.perf_counter() - t0) * 1000, 1)
+    log(f"\n{'~'*70}")
+    log(f"  TOOL COMPLETE: vector_search ({elapsed}ms)")
+    log(f"  Results: {len(results)} documents, output: {len(output)} chars")
+    log(f"{'~'*70}")
+    return output
 
 
 async def sql_lookup_impl(
     query_name: str,
     params: dict[str, Any] | None = None,
 ) -> str:
-    """Execute a named SQL query and return formatted rows."""
-    from sqlalchemy import text as sql_text
-    from app.models.database import async_session_factory
+    t0 = time.perf_counter()
+    log(f"\n{'~'*70}")
+    log(f"  TOOL: sql_lookup")
+    log(f"  Query name: {query_name}")
+    log(f"  Params: {params}")
+    log(f"{'~'*70}")
 
     if query_name not in QUERY_REGISTRY:
+        log(f"  ERROR: Unknown query '{query_name}'")
+        log(f"  Available: {list(QUERY_REGISTRY.keys())}")
         return (
             f"Unknown query: {query_name}. "
             f"Available: {list(QUERY_REGISTRY.keys())}"
@@ -109,23 +123,31 @@ async def sql_lookup_impl(
     safe_params = dict(params) if params else {}
     safe_params.setdefault("limit", 10)
 
+    log(f"  SQL: {template}")
+    log(f"  Resolved params: {safe_params}")
+
     try:
         async with async_session_factory() as session:
             result = await session.execute(sql_text(template), safe_params)
             rows = result.mappings().all()
         if not rows:
+            log(f"  RESULT: No rows found")
             return "No results found."
-        return "\n".join(str(dict(row)) for row in rows[:20])
+
+        output = "\n".join(str(dict(row)) for row in rows[:20])
+        elapsed = round((time.perf_counter() - t0) * 1000, 1)
+        log(f"\n  SQL RESULT ({len(rows)} rows, {elapsed}ms):")
+        log(f"  {'─'*60}")
+        log(f"  {output[:500]}")
+        log(f"  {'─'*60}")
+        return output
     except Exception as e:
-        logger.error("sql_lookup_error", query=query_name, error=str(e))
+        elapsed = round((time.perf_counter() - t0) * 1000, 1)
+        log(f"  SQL ERROR ({elapsed}ms): {e}")
         return f"Query error: {e}"
 
 
 async def code_interpreter_impl(code: str) -> dict[str, Any]:
-    """Execute Python code in a sandboxed environment."""
-    import io
-    import contextlib
-
     stdout = io.StringIO()
     stderr = io.StringIO()
     result: dict[str, Any] = {"stdout": "", "stderr": "", "success": False}
@@ -139,15 +161,8 @@ async def code_interpreter_impl(code: str) -> dict[str, Any]:
     except Exception as e:
         result["stderr"] = f"{type(e).__name__}: {e}"
 
-    logger.info(
-        "code_interpreter",
-        success=result["success"],
-        code_len=len(code),
-    )
     return result
 
-
-# ── Unified Dispatcher (used by /mcp/dispatch REST endpoint) ─────────
 
 TOOL_DISPATCH: dict[str, Any] = {
     "vector_search": vector_search_impl,
@@ -163,8 +178,12 @@ async def dispatch_tool(
     role: str = "analyst",
     **extra_deps: Any,
 ) -> Any:
-    """Dispatch a tool call with permission checks and optional audit logging."""
+    t0 = time.perf_counter()
+
+    log(f"\n  DISPATCH: tool={tool_name}  role={role}  args={arguments}")
+
     if not check_permission(role, tool_name):
+        log(f"  DISPATCH DENIED: role '{role}' cannot access '{tool_name}'")
         raise PermissionError(f"Role '{role}' cannot access tool '{tool_name}'")
 
     if tool_name not in TOOL_DISPATCH:
@@ -172,6 +191,9 @@ async def dispatch_tool(
 
     handler = TOOL_DISPATCH[tool_name]
     result = await handler(**arguments)
+
+    elapsed = round((time.perf_counter() - t0) * 1000, 1)
+    log(f"  DISPATCH COMPLETE: tool={tool_name}  ({elapsed}ms, {len(str(result))} chars)")
 
     if session_id:
         from app.mcp.context import context_manager

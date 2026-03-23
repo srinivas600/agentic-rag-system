@@ -1,12 +1,3 @@
-"""LangGraph ReAct agent with tool orchestration.
-
-Architecture:
-  - Tools are module-level ``@tool`` functions that delegate to
-    ``app.mcp.tools`` (the single source of truth for tool logic).
-  - The StateGraph is compiled once and reused for all requests.
-  - Both sync (``run``) and streaming (``run_stream``) execution modes
-    are supported.
-"""
 from __future__ import annotations
 
 import json
@@ -30,15 +21,12 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
+from app.mcp.tools import vector_search_impl, sql_lookup_impl
 from app.models.schemas import ToolCallRecord
+from app.utils.log_utils import log
 from config.settings import settings
 
 logger = structlog.get_logger(__name__)
-
-
-# ═════════════════════════════════════════════════════════════════════
-# System prompt
-# ═════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """You are an intelligent AI assistant with access to a knowledge base and a product catalog.
 
@@ -67,10 +55,6 @@ Rules:
 - Be concise, accurate, and helpful. Cite sources when possible."""
 
 
-# ═════════════════════════════════════════════════════════════════════
-# LangChain @tool definitions (delegate to core implementations)
-# ═════════════════════════════════════════════════════════════════════
-
 @tool
 async def vector_search(
     query: str,
@@ -78,8 +62,6 @@ async def vector_search(
     doc_type: str | None = None,
 ) -> str:
     """Semantic search over the knowledge base. Returns relevant document chunks."""
-    from app.mcp.tools import vector_search_impl
-
     return await vector_search_impl(query, top_k, doc_type)
 
 
@@ -96,17 +78,11 @@ async def sql_lookup(query_name: str, params: dict | None = None) -> str:
     - "product_by_id": {"id": "<uuid>"}
     - "recent_sessions": no required params
     """
-    from app.mcp.tools import sql_lookup_impl
-
     return await sql_lookup_impl(query_name, params)
 
 
 AGENT_TOOLS = [vector_search, sql_lookup]
 
-
-# ═════════════════════════════════════════════════════════════════════
-# LangGraph state
-# ═════════════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -115,16 +91,7 @@ class AgentState(TypedDict):
     iteration: int
 
 
-# ═════════════════════════════════════════════════════════════════════
-# Agent orchestrator
-# ═════════════════════════════════════════════════════════════════════
-
 class AgentOrchestrator:
-    """ReAct-style agent built on LangGraph.
-
-    The compiled graph is reused across requests (it is stateless — all
-    mutable state lives in ``AgentState``).
-    """
 
     def __init__(self) -> None:
         self._max_iter = settings.agent_max_iterations
@@ -147,8 +114,6 @@ class AgentOrchestrator:
 
         self._graph = self._build_graph()
 
-    # ── Graph construction ───────────────────────────────────────────
-
     def _build_graph(self):
         max_iter = self._max_iter
         llm = self._llm
@@ -157,35 +122,77 @@ class AgentOrchestrator:
         def should_continue(state: AgentState) -> str:
             last = state["messages"][-1]
             if state["iteration"] >= max_iter:
+                log(f"\n{'!'*60}")
+                log(f"  AGENT: Max iterations reached ({state['iteration']})")
+                log(f"{'!'*60}")
                 return "end"
             if isinstance(last, AIMessage) and last.tool_calls:
+                tools = [tc["name"] for tc in last.tool_calls]
+                log(f"\n  AGENT DECISION: Call tools -> {tools}  (iteration {state['iteration']})")
                 return "tools"
+            log(f"\n  AGENT DECISION: Finish  (iteration {state['iteration']})")
             return "end"
 
         async def call_model(state: AgentState) -> dict:
+            iteration = state["iteration"] + 1
+
+            log(f"\n{'='*70}")
+            log(f"  AGENT LLM CALL  (iteration {iteration}, messages: {len(state['messages'])})")
+            log(f"{'='*70}")
+
+            t0 = time.perf_counter()
             response = await llm.ainvoke(state["messages"])
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
+
+            if response.tool_calls:
+                log(f"\n  LLM DECIDED TO CALL TOOLS  ({elapsed}ms):")
+                for tc in response.tool_calls:
+                    log(f"    Tool: {tc['name']}")
+                    log(f"    Args: {tc['args']}")
+            else:
+                answer = response.content or "(empty)"
+                log(f"\n  LLM FINAL ANSWER  ({elapsed}ms, {len(answer)} chars):")
+                log(f"  {'─'*60}")
+                log(f"  {answer[:500]}")
+                log(f"  {'─'*60}")
+
             return {
                 "messages": [response],
-                "iteration": state["iteration"] + 1,
+                "iteration": iteration,
             }
 
         async def call_tools(state: AgentState) -> dict:
+            last_ai = state["messages"][-1]
+
+            if isinstance(last_ai, AIMessage) and last_ai.tool_calls:
+                for tc in last_ai.tool_calls:
+                    log(f"\n{'*'*70}")
+                    log(f"  EXECUTING TOOL: {tc['name']}")
+                    log(f"  Arguments: {tc['args']}")
+                    log(f"{'*'*70}")
+
+            t0 = time.perf_counter()
             result = await tool_node.ainvoke(state)
             tool_messages = result.get("messages", [])
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
 
             new_records: list[ToolCallRecord] = []
-            last_ai = state["messages"][-1]
             if isinstance(last_ai, AIMessage) and last_ai.tool_calls:
                 for tc, tm in zip(last_ai.tool_calls, tool_messages):
+                    tool_result = (
+                        tm.content[:500]
+                        if isinstance(tm, ToolMessage)
+                        else None
+                    )
+                    log(f"\n  TOOL RESULT for '{tc['name']}' ({elapsed}ms, {len(tool_result) if tool_result else 0} chars):")
+                    log(f"  {'─'*60}")
+                    log(f"  {(tool_result or '(empty)')[:400]}")
+                    log(f"  {'─'*60}")
                     new_records.append(
                         ToolCallRecord(
                             tool_name=tc["name"],
                             arguments=tc["args"],
-                            result=(
-                                tm.content[:500]
-                                if isinstance(tm, ToolMessage)
-                                else None
-                            ),
+                            result=tool_result,
                             success=True,
                         )
                     )
@@ -205,8 +212,6 @@ class AgentOrchestrator:
         graph.add_edge("tools", "agent")
         return graph.compile()
 
-    # ── Non-streaming execution ──────────────────────────────────────
-
     async def run(
         self,
         query: str,
@@ -216,6 +221,12 @@ class AgentOrchestrator:
     ) -> dict[str, Any]:
         start = time.perf_counter()
         session_id = session_id or str(uuid.uuid4())
+
+        log(f"\n{'#'*70}")
+        log(f"  AGENT RUN START")
+        log(f"  Session: {session_id}")
+        log(f"  Query: {query}")
+        log(f"{'#'*70}")
 
         initial_state: AgentState = {
             "messages": [
@@ -237,13 +248,15 @@ class AgentOrchestrator:
 
         elapsed = (time.perf_counter() - start) * 1000
 
-        logger.info(
-            "agent_run_complete",
-            session_id=session_id,
-            iterations=final_state["iteration"],
-            tool_calls=len(final_state["tool_calls_log"]),
-            latency_ms=round(elapsed, 2),
-        )
+        log(f"\n{'#'*70}")
+        log(f"  AGENT RUN COMPLETE")
+        log(f"  Iterations: {final_state['iteration']}")
+        log(f"  Tool calls: {len(final_state['tool_calls_log'])}")
+        log(f"  Latency: {round(elapsed, 1)}ms")
+        log(f"  Answer ({len(answer)} chars):")
+        log(f"  {'─'*60}")
+        log(f"  {answer[:500]}")
+        log(f"{'#'*70}\n")
 
         return {
             "answer": answer,
@@ -253,8 +266,6 @@ class AgentOrchestrator:
             "latency_ms": round(elapsed, 2),
         }
 
-    # ── Streaming execution (SSE) ────────────────────────────────────
-
     async def run_stream(
         self,
         query: str,
@@ -262,12 +273,14 @@ class AgentOrchestrator:
         session_id: str | None = None,
         tenant_id: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Stream agent execution as SSE events.
-
-        Yields dicts: ``{"event": "<type>", "data": <payload>}``
-        """
         start = time.perf_counter()
         session_id = session_id or str(uuid.uuid4())
+
+        log(f"\n{'#'*70}")
+        log(f"  AGENT STREAM START")
+        log(f"  Session: {session_id}")
+        log(f"  Query: {query}")
+        log(f"{'#'*70}")
 
         yield {"event": "status", "data": "Starting agent..."}
 
@@ -281,6 +294,11 @@ class AgentOrchestrator:
         while iteration < self._max_iter:
             iteration += 1
             yield {"event": "status", "data": "Thinking..."}
+
+            log(f"\n{'='*70}")
+            log(f"  AGENT LLM CALL  (iteration {iteration})")
+            log(f"{'='*70}")
+            t_llm = time.perf_counter()
 
             collected_content = ""
             collected_tool_calls: list[dict] = []
@@ -299,13 +317,9 @@ class AgentOrchestrator:
                                     {"name": "", "args": "", "id": ""}
                                 )
                             if tc_chunk.get("name"):
-                                collected_tool_calls[idx]["name"] = tc_chunk[
-                                    "name"
-                                ]
+                                collected_tool_calls[idx]["name"] = tc_chunk["name"]
                             if tc_chunk.get("args"):
-                                collected_tool_calls[idx]["args"] += tc_chunk[
-                                    "args"
-                                ]
+                                collected_tool_calls[idx]["args"] += tc_chunk["args"]
                             if tc_chunk.get("id"):
                                 collected_tool_calls[idx]["id"] = tc_chunk["id"]
 
@@ -316,13 +330,23 @@ class AgentOrchestrator:
                         args = json.loads(tc["args"]) if tc["args"] else {}
                     except json.JSONDecodeError:
                         args = {}
-                    parsed_tool_calls.append(
-                        {
-                            "name": tc["name"],
-                            "args": args,
-                            "id": tc["id"] or str(uuid.uuid4()),
-                        }
-                    )
+                    parsed_tool_calls.append({
+                        "name": tc["name"],
+                        "args": args,
+                        "id": tc["id"] or str(uuid.uuid4()),
+                    })
+
+            llm_elapsed = round((time.perf_counter() - t_llm) * 1000, 1)
+            if parsed_tool_calls:
+                log(f"\n  LLM DECIDED TO CALL TOOLS  ({llm_elapsed}ms):")
+                for tc in parsed_tool_calls:
+                    log(f"    Tool: {tc['name']}")
+                    log(f"    Args: {tc['args']}")
+            else:
+                log(f"\n  LLM FINAL ANSWER  ({llm_elapsed}ms, {len(collected_content)} chars):")
+                log(f"  {'─'*60}")
+                log(f"  {collected_content[:500]}")
+                log(f"  {'─'*60}")
 
             full_response = AIMessage(
                 content=collected_content, tool_calls=parsed_tool_calls
@@ -341,15 +365,21 @@ class AgentOrchestrator:
                 tool_fn = self._tools_by_name.get(tc["name"])
                 if tool_fn:
                     try:
-                        yield {
-                            "event": "status",
-                            "data": f"Running {tc['name']}...",
-                        }
-                        result_text = str(await tool_fn.ainvoke(tc["args"]))[
-                            :500
-                        ]
+                        yield {"event": "status", "data": f"Running {tc['name']}..."}
+                        log(f"\n{'*'*70}")
+                        log(f"  EXECUTING TOOL: {tc['name']}")
+                        log(f"  Arguments: {tc['args']}")
+                        log(f"{'*'*70}")
+                        t_tool = time.perf_counter()
+                        result_text = str(await tool_fn.ainvoke(tc["args"]))[:500]
+                        tool_elapsed = round((time.perf_counter() - t_tool) * 1000, 1)
+                        log(f"\n  TOOL RESULT for '{tc['name']}' ({tool_elapsed}ms, {len(result_text)} chars):")
+                        log(f"  {'─'*60}")
+                        log(f"  {result_text[:400]}")
+                        log(f"  {'─'*60}")
                     except Exception as e:
                         result_text = f"Tool error: {e}"
+                        log(f"\n  TOOL ERROR for '{tc['name']}': {e}")
                 else:
                     result_text = f"Unknown tool: {tc['name']}"
 
@@ -361,28 +391,20 @@ class AgentOrchestrator:
                         success="error" not in result_text.lower(),
                     )
                 )
-
-                messages.append(
-                    ToolMessage(content=result_text, tool_call_id=tc["id"])
-                )
-
+                messages.append(ToolMessage(content=result_text, tool_call_id=tc["id"]))
                 yield {
                     "event": "tool_result",
-                    "data": {
-                        "tool": tc["name"],
-                        "result": result_text[:200],
-                    },
+                    "data": {"tool": tc["name"], "result": result_text[:200]},
                 }
 
         elapsed = (time.perf_counter() - start) * 1000
 
-        logger.info(
-            "agent_stream_complete",
-            session_id=session_id,
-            iterations=iteration,
-            tool_calls=len(tool_calls_log),
-            latency_ms=round(elapsed, 2),
-        )
+        log(f"\n{'#'*70}")
+        log(f"  AGENT STREAM COMPLETE")
+        log(f"  Iterations: {iteration}")
+        log(f"  Tool calls: {len(tool_calls_log)}")
+        log(f"  Total latency: {round(elapsed, 1)}ms")
+        log(f"{'#'*70}\n")
 
         yield {
             "event": "done",

@@ -6,15 +6,12 @@ from typing import AsyncGenerator
 
 from sqlalchemy import (
     Column,
-    Text,
-    Integer,
-    Numeric,
     DateTime,
     Float,
     ForeignKey,
-    Index,
+    Integer,
     String,
-    event,
+    Text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -84,7 +81,7 @@ class Document(Base):
 
 db_url = settings.effective_database_url
 
-engine_kwargs: dict = {"echo": settings.api_debug}
+engine_kwargs: dict = {"echo": False}
 if _is_dev:
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
@@ -99,7 +96,6 @@ async_session_factory = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Create all tables (used in dev mode with SQLite)."""
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

@@ -1,33 +1,39 @@
 from __future__ import annotations
 
+import json as _json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 import structlog
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import StreamingResponse
 from sqlalchemy import text as sql_text
+from starlette.responses import StreamingResponse
 
-from config.settings import settings
+from app.logging_config import setup_logging
+
+setup_logging(log_level="INFO")
+
+from app.evaluation.metrics import metrics_collector
+from app.ingestion.pipeline import ingestion_pipeline
+from app.mcp.context import context_manager
+from app.mcp.tools import ROLE_PERMISSIONS, TOOL_DISPATCH, dispatch_tool
 from app.models.database import async_engine, async_session_factory, init_db
 from app.models.schemas import (
-    QueryRequest,
-    QueryResponse,
     DocumentIngest,
     DocumentIngestResponse,
     HealthResponse,
+    QueryRequest,
+    QueryResponse,
 )
 from app.services.agent import agent_orchestrator
+from app.services.rag_pipeline import rag_pipeline
 from app.services.vectordb import health_check as vectordb_health_check
-from app.ingestion.pipeline import ingestion_pipeline
-from app.evaluation.metrics import metrics_collector
-from app.mcp.context import context_manager
+from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
@@ -50,7 +56,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Agentic RAG System",
-    description="Agentic AI + RAG system with LangChain, LangGraph & FastMCP",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -63,7 +68,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Frontend static files ────────────────────────────────────────────
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
@@ -73,11 +77,8 @@ async def serve_frontend():
     return FileResponse(str(FRONTEND_DIR / "index.html"))
 
 
-# ── Health ───────────────────────────────────────────────────────────
-
 @app.get("/health", response_model=HealthResponse, tags=["system"])
 async def health_check():
-    """Check connectivity to all dependent services."""
     pg_ok = False
     redis_ok = False
     pinecone_ok = False
@@ -114,11 +115,9 @@ async def health_check():
     )
 
 
-# ── Agent Query ──────────────────────────────────────────────────────
-
 @app.post("/query", response_model=QueryResponse, tags=["agent"])
 async def agent_query(request: QueryRequest):
-    """Send a query to the LangGraph agent (non-streaming)."""
+    logger.info("api_query_received", query=request.query, session_id=str(request.session_id) if request.session_id else None)
     try:
         result = await agent_orchestrator.run(
             query=request.query,
@@ -136,6 +135,15 @@ async def agent_query(request: QueryRequest):
             agent=agent_metrics,
         )
 
+        logger.info(
+            "api_query_complete",
+            session_id=result["session_id"],
+            iterations=result["iterations"],
+            tool_calls=len(result["tool_calls"]),
+            latency_ms=result["latency_ms"],
+            answer_preview=result["answer"][:200],
+        )
+
         return QueryResponse(
             answer=result["answer"],
             session_id=uuid.UUID(result["session_id"]),
@@ -148,13 +156,8 @@ async def agent_query(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Agent Query (Streaming) ──────────────────────────────────────────
-
 @app.post("/query/stream", tags=["agent"])
 async def agent_query_stream(request: QueryRequest):
-    """Stream the agent response as Server-Sent Events."""
-    import json as _json
-
     async def event_generator():
         try:
             async for event in agent_orchestrator.run_stream(
@@ -200,11 +203,8 @@ async def agent_query_stream(request: QueryRequest):
     )
 
 
-# ── Document Ingestion ───────────────────────────────────────────────
-
 @app.post("/ingest", response_model=DocumentIngestResponse, tags=["ingestion"])
 async def ingest_document(request: DocumentIngest):
-    """Ingest a document. Dev mode = sync, production = Celery queue."""
     if settings.dev_mode:
         result = await ingestion_pipeline.ingest(
             title=request.title,
@@ -251,7 +251,6 @@ async def ingest_document(request: DocumentIngest):
 
 @app.post("/ingest/sync", response_model=DocumentIngestResponse, tags=["ingestion"])
 async def ingest_document_sync(request: DocumentIngest):
-    """Synchronous document ingestion (bypasses Celery queue)."""
     try:
         result = await ingestion_pipeline.ingest(
             title=request.title,
@@ -270,8 +269,6 @@ async def ingest_document_sync(request: DocumentIngest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Search ───────────────────────────────────────────────────────────
-
 @app.post("/search", tags=["retrieval"])
 async def search_documents(
     query: str,
@@ -279,27 +276,21 @@ async def search_documents(
     doc_type: str | None = None,
     tenant_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Direct RAG retrieval without the agent loop."""
-    from app.services.rag_pipeline import rag_pipeline
-
+    logger.info("api_search_received", query=query, top_k=top_k, doc_type=doc_type)
     results = await rag_pipeline.retrieve(
         query=query,
         top_k=top_k,
         doc_type=doc_type,
         tenant_id=tenant_id,
     )
+    logger.info("api_search_complete", query=query[:80], results=len(results))
     return results
 
 
-# ── Metrics ──────────────────────────────────────────────────────────
-
 @app.get("/metrics", tags=["monitoring"])
 async def get_metrics() -> dict[str, Any]:
-    """Get aggregated system metrics."""
     return await metrics_collector.get_summary()
 
-
-# ── MCP Tools ────────────────────────────────────────────────────────
 
 @app.post("/mcp/dispatch", tags=["mcp"])
 async def mcp_dispatch_tool(
@@ -308,9 +299,6 @@ async def mcp_dispatch_tool(
     session_id: str | None = None,
     role: str = "analyst",
 ) -> Any:
-    """Dispatch an MCP tool call with permission checks."""
-    from app.mcp.tools import dispatch_tool
-
     try:
         result = await dispatch_tool(
             tool_name=tool_name,
@@ -330,23 +318,16 @@ async def mcp_dispatch_tool(
 
 @app.get("/mcp/tools", tags=["mcp"])
 async def list_mcp_tools(role: str = "analyst") -> dict[str, Any]:
-    """List available MCP tools for a given role."""
-    from app.mcp.tools import ROLE_PERMISSIONS, TOOL_DISPATCH
-
     allowed = ROLE_PERMISSIONS.get(role, set())
     available = [t for t in TOOL_DISPATCH if t in allowed]
     return {"role": role, "tools": available}
 
 
-# ── Session Context ──────────────────────────────────────────────────
-
 @app.get("/session/{session_id}/context", tags=["session"])
 async def get_session_context(session_id: str) -> dict[str, Any]:
-    """Get the shared context for a session."""
     return await context_manager.get_context(session_id)
 
 
 @app.get("/session/{session_id}/tool-calls", tags=["session"])
 async def get_session_tool_calls(session_id: str) -> list[dict]:
-    """Get the tool call audit trail for a session."""
     return await context_manager.get_tool_calls(session_id)

@@ -1,10 +1,6 @@
-"""Hybrid retriever: dense (Pinecone) + sparse (SQL) + RRF + cross-encoder reranking.
-
-Implements Reciprocal Rank Fusion and cross-encoder reranking inside a
-single ``BaseRetriever`` subclass, compatible with any LangChain chain.
-"""
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import structlog
@@ -14,19 +10,19 @@ from langchain_core.retrievers import BaseRetriever
 from pydantic import Field
 from sqlalchemy import text
 
-from config.settings import settings
 from app.models.database import async_session_factory
+from app.services.reranker import get_compressor
+from app.services.vectordb import get_vectorstore
+from app.utils.log_utils import log
+from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
 
-# ── Sparse (BM25 / keyword) retriever backed by SQL ─────────────────
-
 class SQLSparseRetriever(BaseRetriever):
-    """Keyword retrieval from PostgreSQL (tsvector) or SQLite (LIKE)."""
 
-    k: int = Field(default=20, description="Number of results to return")
-    doc_type: str | None = Field(default=None, description="Filter by document type")
+    k: int = Field(default=20)
+    doc_type: str | None = Field(default=None)
 
     def _get_relevant_documents(
         self,
@@ -34,7 +30,7 @@ class SQLSparseRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun | None = None,
     ) -> list[Document]:
-        raise NotImplementedError("Use ainvoke() — this retriever is async-only")
+        raise NotImplementedError("Use ainvoke()")
 
     async def _aget_relevant_documents(
         self,
@@ -42,6 +38,10 @@ class SQLSparseRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun | None = None,
     ) -> list[Document]:
+        t0 = time.perf_counter()
+
+        log(f"\n    [SPARSE] SQL keyword search (k={self.k})...")
+
         params: dict[str, Any] = {"limit": self.k}
 
         if settings.dev_mode:
@@ -63,6 +63,7 @@ class SQLSparseRetriever(BaseRetriever):
                 f"SELECT id, content, source_url, doc_type, title, 1.0 AS rank "
                 f"FROM documents WHERE {where} LIMIT :limit"
             )
+            log(f"    [SPARSE] Mode: SQLite LIKE  |  Keywords: {words[:5]}")
         else:
             conditions = [
                 "text_search_vector @@ plainto_tsquery('english', :query)"
@@ -78,6 +79,7 @@ class SQLSparseRetriever(BaseRetriever):
                 f"ts_rank(text_search_vector, plainto_tsquery('english', :query)) AS rank "
                 f"FROM documents WHERE {where} ORDER BY rank DESC LIMIT :limit"
             )
+            log(f"    [SPARSE] Mode: PostgreSQL tsvector")
 
         async with async_session_factory() as session:
             result = await session.execute(sql, params)
@@ -97,26 +99,21 @@ class SQLSparseRetriever(BaseRetriever):
             )
             for row in rows
         ]
-        logger.debug("sparse_retrieval", query=query[:80], results=len(docs))
+
+        elapsed = round((time.perf_counter() - t0) * 1000, 1)
+        log(f"    [SPARSE] RESULTS: {len(docs)} docs ({elapsed}ms)")
+        for i, doc in enumerate(docs[:5]):
+            log(f"      #{i+1}  score={doc.metadata['retrieval_score']}  title='{doc.metadata.get('title', '')}'")
+            log(f"           {doc.page_content[:120]}")
         return docs
 
 
-# ── Hybrid retriever (dense + sparse + RRF + reranking) ─────────────
-
 class HybridRetriever(BaseRetriever):
-    """Combines PineconeVectorStore (dense) + SQL (sparse) with RRF and reranking.
-
-    Pipeline:
-      1. Dense search via PineconeVectorStore  (k=20)
-      2. Sparse search via SQLSparseRetriever  (k=20)
-      3. Reciprocal Rank Fusion to merge results
-      4. Cross-encoder reranking for final selection
-    """
 
     dense_k: int = Field(default=20)
     sparse_k: int = Field(default=20)
     rerank_top_n: int = Field(default=5)
-    rrf_k: int = Field(default=60, description="RRF constant")
+    rrf_k: int = Field(default=60)
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -126,14 +123,13 @@ class HybridRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun | None = None,
     ) -> list[Document]:
-        raise NotImplementedError("Use ainvoke() — this retriever is async-only")
+        raise NotImplementedError("Use ainvoke()")
 
     @staticmethod
     def _rrf_merge(
         *result_lists: list[Document],
         k: int = 60,
     ) -> list[Document]:
-        """Reciprocal Rank Fusion: RRF_score(d) = Σ 1/(k + rank_i(d))."""
         scores: dict[str, float] = {}
         doc_map: dict[str, Document] = {}
 
@@ -160,39 +156,57 @@ class HybridRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun | None = None,
     ) -> list[Document]:
-        from app.services.vectordb import get_vectorstore
-        from app.services.reranker import get_compressor
+        t0 = time.perf_counter()
+        log(f"\n  {'='*60}")
+        log(f"  HYBRID RETRIEVAL START")
+        log(f"  Query: {query[:200]}")
+        log(f"  {'='*60}")
 
         vectorstore = get_vectorstore()
 
-        # 1. Dense (Pinecone) — async via VectorStore
+        log(f"\n    [DENSE] Pinecone vector search (k={self.dense_k})...")
+        t_dense = time.perf_counter()
         dense_docs = await vectorstore.asimilarity_search(query, k=self.dense_k)
         for doc in dense_docs:
             doc.metadata.setdefault("source", "dense")
             doc.metadata.setdefault("id", str(id(doc)))
+        dense_ms = round((time.perf_counter() - t_dense) * 1000, 1)
+        log(f"    [DENSE] RESULTS: {len(dense_docs)} docs ({dense_ms}ms)")
+        for i, doc in enumerate(dense_docs[:5]):
+            log(f"      #{i+1}  title='{doc.metadata.get('title', '')}'")
+            log(f"           {doc.page_content[:120]}")
 
-        # 2. Sparse (SQL)
         sparse = SQLSparseRetriever(k=self.sparse_k)
         sparse_docs = await sparse.ainvoke(query)
 
-        # 3. RRF merge
+        log(f"\n    [RRF] Reciprocal Rank Fusion (k={self.rrf_k})...")
+        t_rrf = time.perf_counter()
         merged = self._rrf_merge(dense_docs, sparse_docs, k=self.rrf_k)
+        rrf_ms = round((time.perf_counter() - t_rrf) * 1000, 1)
+        log(f"    [RRF] MERGED: {len(dense_docs)} dense + {len(sparse_docs)} sparse = {len(merged)} unique ({rrf_ms}ms)")
+        log(f"    [RRF] Top 5 merged results:")
+        for i, doc in enumerate(merged[:5]):
+            log(f"      #{i+1}  rrf_score={round(doc.metadata.get('rrf_score', 0), 4)}  source={doc.metadata.get('source', '')}  title='{doc.metadata.get('title', '')}'")
 
-        # 4. Cross-encoder reranking
+        log(f"\n    [RERANK] Cross-encoder reranking ({len(merged)} candidates)...")
+        t_rerank = time.perf_counter()
         compressor = get_compressor()
         if merged:
             reranked = compressor.compress_documents(merged, query)
         else:
             reranked = []
+        rerank_ms = round((time.perf_counter() - t_rerank) * 1000, 1)
+        log(f"    [RERANK] COMPLETE: {len(merged)} -> {len(reranked)} docs ({rerank_ms}ms)")
+        log(f"    [RERANK] Top reranked results:")
+        for i, doc in enumerate(list(reranked)[:5]):
+            log(f"      #{i+1}  relevance={round(doc.metadata.get('relevance_score', 0), 4)}  source={doc.metadata.get('source', '')}  title='{doc.metadata.get('title', '')}'")
+            log(f"           {doc.page_content[:120]}")
 
-        logger.info(
-            "hybrid_retrieval",
-            query=query[:80],
-            dense=len(dense_docs),
-            sparse=len(sparse_docs),
-            merged=len(merged),
-            final=len(reranked),
-        )
+        total_ms = round((time.perf_counter() - t0) * 1000, 1)
+        log(f"\n  {'='*60}")
+        log(f"  HYBRID RETRIEVAL COMPLETE ({total_ms}ms)")
+        log(f"  dense={len(dense_docs)} | sparse={len(sparse_docs)} | merged={len(merged)} | final={len(list(reranked))}")
+        log(f"  {'='*60}")
         return list(reranked)
 
 
@@ -200,9 +214,8 @@ _retriever: HybridRetriever | None = None
 
 
 def get_retriever_chain() -> HybridRetriever:
-    """Lazy singleton for the full hybrid retriever."""
     global _retriever
     if _retriever is None:
         _retriever = HybridRetriever()
-        logger.info("hybrid_retriever_initialized")
+        log("  [INIT] Hybrid retriever initialized")
     return _retriever

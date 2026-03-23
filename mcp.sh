@@ -1,0 +1,1 @@
+npx @modelcontextprotocol/inspector -- venv/Scripts/python.exe test/mcp_server.py

@@ -4,6 +4,7 @@ import structlog
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 
+from app.services.embeddings import get_embeddings
 from config.settings import settings
 
 logger = structlog.get_logger(__name__)
@@ -13,11 +14,8 @@ _pc: Pinecone | None = None
 
 
 def get_vectorstore() -> PineconeVectorStore:
-    """Lazy-initialised PineconeVectorStore backed by LangChain embeddings."""
     global _vectorstore, _pc
     if _vectorstore is None:
-        from app.services.embeddings import get_embeddings
-
         _pc = Pinecone(api_key=settings.pinecone_api_key)
         existing = [idx.name for idx in _pc.list_indexes()]
 
@@ -43,10 +41,9 @@ def get_vectorstore() -> PineconeVectorStore:
 
 
 async def health_check() -> bool:
-    """Verify Pinecone connectivity."""
     try:
         get_vectorstore()
-        _pc.Index(settings.pinecone_index_name).describe_index_stats()  # type: ignore[union-attr]
+        _pc.Index(settings.pinecone_index_name).describe_index_stats()
         return True
     except Exception:
         logger.exception("vectordb_health_check_failed")

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import structlog
 import tiktoken
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config.settings import settings
 
@@ -23,11 +24,14 @@ class Chunk:
 
 class HierarchicalChunker:
     """
-    Implements 'small-to-big' hierarchical chunking.
+    Implements 'small-to-big' hierarchical chunking using LangChain splitters.
 
-    Creates parent chunks (512 tokens) and child chunks (128 tokens).
-    Retrieval targets child chunks for precision, but the agent gets
-    parent chunks for fuller context.
+    Uses RecursiveCharacterTextSplitter with tiktoken encoding so splits
+    happen at natural boundaries (paragraphs → sentences → words) while
+    respecting token limits.
+
+    Creates parent chunks for full context and child chunks for precise
+    retrieval.
     """
 
     def __init__(
@@ -42,26 +46,22 @@ class HierarchicalChunker:
         self._overlap = overlap or settings.chunk_overlap
         self._enc = tiktoken.get_encoding(encoding_name)
 
+        self._parent_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name=encoding_name,
+            chunk_size=self._parent_size,
+            chunk_overlap=self._overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
+        self._child_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name=encoding_name,
+            chunk_size=self._child_size,
+            chunk_overlap=self._overlap // 2,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
     def _count_tokens(self, text: str) -> int:
         return len(self._enc.encode(text))
-
-    def _split_by_tokens(self, text: str, max_tokens: int, overlap: int) -> list[str]:
-        """Split text into chunks of max_tokens with overlap."""
-        tokens = self._enc.encode(text)
-        chunks = []
-        start = 0
-
-        while start < len(tokens):
-            end = start + max_tokens
-            chunk_tokens = tokens[start:end]
-            chunk_text = self._enc.decode(chunk_tokens)
-            chunks.append(chunk_text)
-
-            if end >= len(tokens):
-                break
-            start = end - overlap
-
-        return chunks
 
     def chunk(self, text: str, doc_id: str | None = None) -> list[Chunk]:
         """
@@ -72,7 +72,7 @@ class HierarchicalChunker:
         """
         all_chunks: list[Chunk] = []
 
-        parent_texts = self._split_by_tokens(text, self._parent_size, self._overlap)
+        parent_texts = self._parent_splitter.split_text(text)
 
         for p_idx, parent_text in enumerate(parent_texts):
             parent_chunk = Chunk(
@@ -83,9 +83,7 @@ class HierarchicalChunker:
             )
             all_chunks.append(parent_chunk)
 
-            child_texts = self._split_by_tokens(
-                parent_text, self._child_size, self._overlap // 2
-            )
+            child_texts = self._child_splitter.split_text(parent_text)
             for c_idx, child_text in enumerate(child_texts):
                 child_chunk = Chunk(
                     text=child_text,

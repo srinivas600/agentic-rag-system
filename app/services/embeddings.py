@@ -11,7 +11,6 @@ _embeddings: OpenAIEmbeddings | None = None
 
 
 def get_embeddings() -> OpenAIEmbeddings:
-    """Lazy-initialised LangChain OpenAI embeddings instance."""
     global _embeddings
     if _embeddings is None:
         _embeddings = OpenAIEmbeddings(
@@ -28,4 +27,4 @@ def get_embeddings() -> OpenAIEmbeddings:
 
 
 async def close() -> None:
-    """No-op — LangChain embeddings need no explicit cleanup."""
+    pass

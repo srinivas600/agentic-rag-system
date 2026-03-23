@@ -9,18 +9,13 @@ from langchain_core.documents.compressor import BaseDocumentCompressor
 from pydantic import PrivateAttr
 from sentence_transformers import CrossEncoder
 
+from app.utils.log_utils import log
 from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
 
 class CrossEncoderCompressor(BaseDocumentCompressor):
-    """Cross-encoder reranker wrapped as a LangChain document compressor.
-
-    Scores each (query, document) pair with a cross-encoder and returns the
-    top_n documents sorted by relevance.  The score is stored in
-    ``doc.metadata["relevance_score"]``.
-    """
 
     model_name: str = settings.reranker_model
     top_n: int = settings.reranker_top_k
@@ -31,7 +26,7 @@ class CrossEncoderCompressor(BaseDocumentCompressor):
     @property
     def _cross_encoder(self) -> CrossEncoder:
         if self._model is None:
-            logger.info("loading_cross_encoder", model=self.model_name)
+            log(f"      [CROSS-ENCODER] Loading model: {self.model_name}")
             self._model = CrossEncoder(self.model_name)
         return self._model
 
@@ -43,6 +38,9 @@ class CrossEncoderCompressor(BaseDocumentCompressor):
     ) -> Sequence[Document]:
         if not documents:
             return []
+
+        log(f"\n      [CROSS-ENCODER] Model: {self.model_name}")
+        log(f"      [CROSS-ENCODER] Scoring {len(documents)} candidates against query...")
 
         pairs = [(query, doc.page_content) for doc in documents]
         scores = self._cross_encoder.predict(pairs)
@@ -56,12 +54,19 @@ class CrossEncoderCompressor(BaseDocumentCompressor):
         ranked = sorted(
             scored, key=lambda d: d.metadata["relevance_score"], reverse=True
         )
-        logger.info(
-            "reranked",
-            input=len(documents),
-            output=min(self.top_n, len(ranked)),
-            top_score=ranked[0].metadata["relevance_score"] if ranked else None,
-        )
+
+        log(f"      [CROSS-ENCODER] ALL SCORES (top_n={self.top_n}):")
+        for i, doc in enumerate(ranked):
+            marker = ">>>" if i < self.top_n else "   "
+            log(f"      {marker} #{i+1}  score={round(doc.metadata['relevance_score'], 4)}  "
+                f"src={doc.metadata.get('source', '')}  "
+                f"title='{doc.metadata.get('title', '')}'")
+
+        top_score = ranked[0].metadata["relevance_score"] if ranked else 0
+        cutoff = ranked[self.top_n - 1].metadata["relevance_score"] if len(ranked) >= self.top_n else 0
+        log(f"      [CROSS-ENCODER] SELECTED: top {min(self.top_n, len(ranked))} of {len(documents)}  "
+            f"(best={round(top_score, 4)}, cutoff={round(cutoff, 4)})")
+
         return ranked[: self.top_n]
 
 
@@ -69,7 +74,6 @@ _compressor: CrossEncoderCompressor | None = None
 
 
 def get_compressor() -> CrossEncoderCompressor:
-    """Lazy singleton for the cross-encoder compressor."""
     global _compressor
     if _compressor is None:
         _compressor = CrossEncoderCompressor()
