@@ -38,9 +38,7 @@ class SourceDocument(BaseModel):
     score: float
     source_url: str | None = None
     doc_type: str | None = None
-
-
-# Rebuild QueryResponse now that SourceDocument is defined
+    
 QueryResponse.model_rebuild()
 
 

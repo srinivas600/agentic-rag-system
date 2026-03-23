@@ -11,6 +11,7 @@ import structlog
 from celery import Celery
 
 from config.settings import settings
+from app.ingestion.pipeline import ingestion_pipeline
 
 logger = structlog.get_logger(__name__)
 
@@ -51,8 +52,6 @@ def ingest_document_task(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Celery task: ingest a single document through the full pipeline."""
-    from app.ingestion.pipeline import ingestion_pipeline
-
     try:
         result = _run_async(
             ingestion_pipeline.ingest(
@@ -76,7 +75,6 @@ def ingest_batch_task(
     documents: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Celery task: ingest a batch of documents."""
-    from app.ingestion.pipeline import ingestion_pipeline
 
     try:
         results = _run_async(ingestion_pipeline.ingest_batch(documents))

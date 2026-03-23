@@ -9,6 +9,8 @@ import structlog
 from sqlalchemy import text as sql_text
 
 from app.models.database import async_session_factory
+from app.services.rag_pipeline import rag_pipeline
+from app.mcp.context import context_manager
 from app.utils.log_utils import log
 
 logger = structlog.get_logger(__name__)
@@ -64,7 +66,6 @@ async def vector_search_impl(
     top_k: int = 5,
     doc_type: str | None = None,
 ) -> str:
-    from app.services.rag_pipeline import rag_pipeline
 
     t0 = time.perf_counter()
     log(f"\n{'~'*70}")
@@ -196,8 +197,6 @@ async def dispatch_tool(
     log(f"  DISPATCH COMPLETE: tool={tool_name}  ({elapsed}ms, {len(str(result))} chars)")
 
     if session_id:
-        from app.mcp.context import context_manager
-
         await context_manager.append_tool_call(
             session_id=session_id,
             tool_name=tool_name,
